@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# Streamlit
+.streamlit/
+
+# Outputs / generated artifacts
+*.csv
+*.json
+
+# OS
+.DS_Store
