@@ -1,3 +1,4 @@
+from statistics import variance
 import streamlit as st
 import random
 import itertools
@@ -14,6 +15,46 @@ if 'seed' not in st.session_state:
     st.session_state.seed = 42
 
 st.set_page_config(page_title="Golf Tourney Sim", layout="wide")
+# ---------------------------
+# STRATEGY / VARIANCE KNOBS
+# ---------------------------
+DEFAULT_STRATEGY_PROFILES = {
+    "Conservative": {
+        "w_winprob": 1.00,
+        "w_ev_margin": 0.60,
+        "w_variance": 1.25,     # penalize variance
+        "w_downside": 1.10,     # penalize worst-case outcomes
+        "lead_protect": 1.15,   # amplify risk control when leading
+        "trail_chase": 0.90,    # reduce risk chasing when trailing
+    },
+    "Balanced": {
+        "w_winprob": 1.00,
+        "w_ev_margin": 0.85,
+        "w_variance": 0.85,
+        "w_downside": 0.85,
+        "lead_protect": 1.00,
+        "trail_chase": 1.00,
+    },
+    "Aggressive": {
+        "w_winprob": 1.00,
+        "w_ev_margin": 1.15,    # reward expected margin more
+        "w_variance": 0.40,     # tolerate variance
+        "w_downside": 0.55,     # tolerate downside more
+        "lead_protect": 0.85,   # less protection when leading
+        "trail_chase": 1.20,    # chase upside when trailing
+    },
+}
+
+if "strategy_profile" not in st.session_state:
+    st.session_state.strategy_profile = "Balanced"
+
+if "strategy_overrides" not in st.session_state:
+    st.session_state.strategy_overrides = {}  # optional slider overrides
+
+def get_strategy():
+    base = DEFAULT_STRATEGY_PROFILES[st.session_state.strategy_profile].copy()
+    base.update(st.session_state.strategy_overrides or {})
+    return base
 
 # Default Players
 DEFAULT_PLAYERS = {
@@ -338,6 +379,17 @@ def simulate_hole_score_scramble(pair, handicaps):
 def simulate_hole_score_alt(pair, handicaps):
     if len(pair) == 1: return handicaps[pair[0]]
     return (handicaps[pair[0]] + handicaps[pair[1]]) / 2
+def make_unique_columns(cols):
+    counts = {}
+    out = []
+    for c in cols:
+        n = counts.get(c, 0)
+        if n == 0:
+            out.append(c)
+        else:
+            out.append(f"{c}_{n}")
+        counts[c] = n +1
+    return out
 
 def generate_pars(num_holes):
     """
@@ -437,6 +489,7 @@ def compute_round_tournament_points(round_holes, expected_matches=None, expected
 def fmt_pair(p):
     if isinstance(p, (list, tuple)): return " & ".join(p)
     return str(p)
+
 def format_debug_df(df):
     """
     Cleans and formats decision-debug tables for readability.
@@ -579,6 +632,7 @@ def play_locked_matchups(matchups, handicaps, match_type):
         })
     return total_a, total_b, all_hole_cards
 def solve_round_pairings(
+        
     team_a,
     team_b,
     handicaps,
@@ -587,8 +641,22 @@ def solve_round_pairings(
     score_diff=0,
     profile_a: Optional[StrategyProfile] = None,
     profile_b: Optional[StrategyProfile] = None,
+    strategy=None,
     decision_debug: Optional[Dict[str, Any]] = None
 ):
+    if strategy is None:
+        strategy = DEFAULT_STRATEGY_PROFILES["Balanced"]
+    def _decision_score(win_pct, exp_margin, variance, strategy):
+        # win_pct expected as 0..100 from your debug, convert to 0..1
+        wp = win_pct / 100.0
+        # Simple, controllable linear score:
+        #  - reward win probability and expected margin
+        # - penalize variance (risk)
+        return (
+            strategy["w_winprob"] * wp +
+            strategy["w_ev_margin"] * exp_margin -
+            strategy["w_variance"] * variance * 10.0  # scale variance appropriately
+        ) 
     """
     Sequential, strategic pairing selection.
     """
@@ -638,18 +706,25 @@ def solve_round_pairings(
                     worst_components = comps
 
             if decision_debug is not None:
+                win_pct = worst_components["win_prob"] * 100 if worst_components else None
+                exp_margin = worst_components["exp_margin"] if worst_components else None
+                variance = worst_components["variance"] if worst_components else None
+                decision_score_wc = (
+                    _decision_score(win_pct, exp_margin, variance, strategy)
+                    if worst_components else None
+                )
                 candidate_rows.append({
-                    "A_pair": " & ".join(pair_a),
-                    "worst_case_B_response": " & ".join(worst_pair_b) if worst_pair_b else None,
-                    "utility(worst_case)": worst_case_u,
-                    "win_prob": worst_components["win_prob"] if worst_components else None,
-                    "exp_margin": worst_components["exp_margin"] if worst_components else None,
-                    "variance": worst_components["variance"] if worst_components else None,
-                    "risk_aversion": worst_components["risk_aversion"] if worst_components else None
+                    "Team A Pair": " & ".join(pair_a),
+                    "Worst B Response": " & ".join(worst_pair_b) if worst_pair_b else None,
+                    "Decision Score (Worst Case)": decision_score_wc,
+                    "Win %": win_pct,
+                    "Expected Margin": exp_margin,
+                    "Variance": variance,
+
                 })
 
-            if worst_case_u > best_u:
-                best_u = worst_case_u
+            if decision_score_wc is not None and decision_score_wc > best_u:
+                best_u = decision_score_wc
                 best_pair_a = pair_a
 
         # Opponent chooses best counter (max utility from B perspective vs chosen A pair)
@@ -666,22 +741,26 @@ def solve_round_pairings(
             )
 
             if decision_debug is not None:
+                win_pct = comps["win_prob"] * 100
+                exp_margin = comps["exp_margin"]
+                variance = comps["variance"]
+                decision_score = _decision_score(win_pct, exp_margin, variance, strategy)
                 b_choice_rows.append({
-                    "B_pair": " & ".join(pair_b),
-                    "utility": u,
-                    "win_prob": comps["win_prob"],
-                    "exp_margin": comps["exp_margin"],
-                    "variance": comps["variance"],
-                    "risk_aversion": comps["risk_aversion"]
+                    "Team B Pair": " & ".join(pair_b),
+                    "Decision Score": decision_score,
+                    "Win %": win_pct,
+                    "Expected Margin": exp_margin,
+                    "Variance": variance,
                 })
 
-            if u > best_b_u:
-                best_b_u = u
+            if decision_score > best_b_u:
+                best_b_u = decision_score
                 best_pair_b = pair_b
 
         if decision_debug is not None:
-            top_a = sorted(candidate_rows, key=lambda r: r["utility(worst_case)"], reverse=True)[:3]
-            top_b = sorted(b_choice_rows, key=lambda r: r["utility"], reverse=True)[:3]
+            top_a = sorted(candidate_rows, key=lambda r: (r["Decision Score (Worst Case)"] is not None, r["Decision Score (Worst Case)"]), reverse=True)[:3]
+            top_b = sorted(b_choice_rows, key=lambda r: (r["Decision Score"] is not None, r["Decision Score"]), reverse=True)[:3]
+
             decision_debug["first_match"] = {
                 "A_candidates_top3": top_a,
                 "A_chosen": " & ".join(best_pair_a),
@@ -704,7 +783,7 @@ def solve_round_pairings(
                 )
                 worst_case_u = min(worst_case_u, u)
 
-            if worst_case_u > best_u:
+        if decision_score_wc is not None and decision_score_wc > best_u:
                 best_u = worst_case_u
                 best_pair_b = pair_b
 
@@ -853,6 +932,7 @@ def run_full_tournament(handicaps):
         score_diff=0,
         profile_a=profile_a,
         profile_b=profile_b,
+        strategy=get_strategy(),
         decision_debug=decision_debug_r1
     )
 
@@ -909,12 +989,36 @@ st.title("⛳ Golf Tournament Simulator")
 # --- SIDEBAR CONFIG ---
 st.sidebar.header("Configuration")
 with st.sidebar.form("config_form"):
-    st.write("### Edit Handicaps")
-    custom_handicaps = {}
-    for p, h in DEFAULT_PLAYERS.items():
-        custom_handicaps[p] = st.number_input(f"{p}", value=h, step=1)
-    
+    with st.expander("### Edit Handicaps"):
+        custom_handicaps = {}
+        for p, h in DEFAULT_PLAYERS.items():
+            custom_handicaps[p] = st.number_input(f"{p}", value=h, step=1)
+    st.markdown("## Strategy")
+    st.session_state.strategy_profile = st.expander(
+        "Variance profile", expanded=False).selectbox(
+        "Select Strategy Profile",
+        options=list(DEFAULT_STRATEGY_PROFILES.keys()),
+        index=list(DEFAULT_STRATEGY_PROFILES.keys()).index(st.session_state.strategy_profile),
+        help="Controls the game-theory weighting between win probability, expected margin, and variance."
+    )
+
+    with st.expander("Advanced variance knobs", expanded=False):
+        s = get_strategy()
+        w_variance = st.slider("Variance penalty", 0.0, 2.0, float(s["w_variance"]), 0.05)
+        w_downside = st.slider("Downside penalty", 0.0, 2.0, float(s["w_downside"]), 0.05)
+        w_ev_margin = st.slider("Expected margin weight", 0.0, 2.0, float(s["w_ev_margin"]), 0.05)
+        lead_protect = st.slider("Protect lead multiplier", 0.5, 1.5, float(s["lead_protect"]), 0.05)
+        trail_chase = st.slider("Chase upside multiplier", 0.5, 1.5, float(s["trail_chase"]), 0.05)
+
+        st.session_state.strategy_overrides = {
+            "w_variance": w_variance,
+            "w_downside": w_downside,
+            "w_ev_margin": w_ev_margin,
+            "lead_protect": lead_protect,
+            "trail_chase": trail_chase,
+        }    
     run_btn = st.form_submit_button("Run Single Simulation")
+
 
 st.sidebar.markdown("---")
 st.sidebar.write("### Monte Carlo Mode")
@@ -973,8 +1077,40 @@ with tab1:
  
                 st.markdown("#### Team A: Top 3 candidate pairs (maximin / worst-case utility)")
                 df_a = format_debug_df(pd.DataFrame(fm["A_candidates_top3"]))
+                if df_a.columns.duplicated().any():
+                    df_a.columns = make_unique_columns(df_a.columns)
+                
+                def unique_preserve_order(items):
+                    seen = set()
+                    out = []
+                    for x in items:
+                        if x not in seen:
+                            out.append(x)
+                            seen.add(x)
+                    return out
+                
                 cols_a = ["Team A Pair", "Worst B Response", "Decision Score (Worst Case)", "Win %", "Expected Margin", "Variance"]
                 cols_a = [c for c in cols_a if c in df_a.columns]
+
+                st.dataframe(df_a[cols_a], hide_index=True, use_container_width=True)
+                st.success(f"Chosen Team A pair: {fm['A_chosen']}")
+
+                st.markdown("#### Team B: Top 3 responses vs chosen Team A pair")
+                df_b = format_debug_df(pd.DataFrame(fm["B_best_response_top3"]))
+
+                if df_b.columns.duplicated().any():
+                    df_b.columns = make_unique_columns(df_b.columns)
+                cols_b = ["Team B Pair", "Decision Score", "Win %", "Expected Margin", "Variance"]
+                cols_b = [c for c in cols_b if c in df_b.columns]
+                st.dataframe(df_b[cols_b], hide_index=True, use_container_width=True)
+                st.info(f"Chosen Team B pair: {fm['B_chosen']}")
+                
+                
+                from collections import Counter
+                dupe_cols_a = [c for c, k in Counter(cols_a).items() if k > 1]
+                if dupe_cols_a:
+                    st.warning(f"Duplicate cols_a entries: {dupe_cols_a}")
+
                 st.dataframe(df_a[cols_a], hide_index=True, use_container_width=True)
                 st.success(f"Chosen Team A pair: {fm['A_chosen']}")
 
